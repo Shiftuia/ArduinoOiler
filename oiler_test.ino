@@ -1,3 +1,4 @@
+#include <RBD_Timer.h>          //библиотека для таймера
 #include <Wire.h>               
 #include <LiquidCrystal_I2C.h>  //библиотека для дисплея
 #include <EEPROM.h>             //библиотека для хранения в EEPROM
@@ -23,10 +24,9 @@ boolean buttonIncrementState;       // состояние кнопки
 boolean buttonIncrementPrevState;   // предыдущее состояние кнопки 
 boolean buttonDecrementState;       // состояние кнопки 
 boolean buttonDecrementPrevState;   // предыдущее состояние кнопки 
-boolean buttonManualOilState;            // состояние кнопки 
-boolean buttonManualOilPrevState;            // предыдущее состояние кнопки 
-
-int oilTime = 50;                      //время срабатывания насоса в милисекундах
+boolean buttonManualOilState;       // состояние кнопки 
+boolean buttonManualOilPrevState;   // предыдущее состояние кнопки 
+                     
 
 
 #define PIN_RELAY 7
@@ -39,16 +39,9 @@ int oilTime = 50;                      //время срабатывания н�
 #define BUTTON_PIN_DECREMENT_OIL_TIME 11
 #define BUTTON_PIN_INCREMENT_OIL_TIME 12
 
-
-unsigned long previousMillisTemp = 0;   // время последнего срабатывания кода для температуры
-unsigned long previousMillisRelay = 0;  // время последнего срабатывания кода для реле
-unsigned long previousMillisRain = 0;   // время последнего срабатывания кода для датчика дождя
-unsigned long previousMillisOdo = 0;    // время последнего срабатывания кода для одометра
-
-const int intervalTemp = 10000;          // интервал срабатывания кода для датчиков температуры, задержка. 
-const int intervalRelay = 1000;         // интервал срабатывания кода для реле, задержка. 
-const int intervalRain = 2000;          // интервал срабатывания кода для датчика дождя, задержка. 
-const int intervalOdo = 1500;           // интервал срабатывания кода для одометра, задержка.
+RBD::Timer timerTempCounter;        // таймера для расчета значений через определенный промежуток времени
+RBD::Timer timerRainCounter;        // т.е. мы накапливали значение в буфер, потом посчитали среднее и все по новой
+RBD::Timer timerOdometerCounter;
 
 TinyGPS gps;
 SoftwareSerial ss(4, 3);
@@ -79,49 +72,55 @@ B00000
 
 
 
-static void smartdelay(unsigned long ms);
-
 //*************************************************************************************************************************
 void setup()
 {
 
   Serial.begin(19200); // подключаем монитор порта
 
-  //GPS
+//GPS
   ss.begin(9600);
 
-  //Buzzer
+//Buzzer пикает при включении
   pinMode(SOUND_PIN, OUTPUT);
   digitalWrite(SOUND_PIN, HIGH);  // Звук вкл
   delay(100);
   digitalWrite(SOUND_PIN, LOW);  //Звук выкл
   
 
-  //OilDistance
+//OilDistance
   hi = EEPROM.read(1);
   low = EEPROM.read(2);
   int res = word(hi, low);
   distanceToOil = res;
   
-  //Button
+//Button
    pinMode(BUTTON_PIN_INCREMENT_OIL_TIME, INPUT_PULLUP);
    pinMode(BUTTON_PIN_DECREMENT_OIL_TIME, INPUT_PULLUP);
    pinMode(BUTTON_MANUAL_OIL, INPUT_PULLUP);
   
-  //Relay
+//Relay
   pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, HIGH);  //Реле закрыто
 
-  //Rain Sensor
-  pinMode(PIN_RAIN_SENSOR, INPUT);
+//Rain Sensor
+  pinMode(PIN_RAIN_SENSOR, INPUT);    // Подключаем аналоговый вход с датчика дождя к A3
   rainSenseReading = 0;
   rainGoCounter = 0;
   rainBuff = 0;
   rainMeasureCount = 0;
   isRain = false;
+
+//Analog temp
+  pinMode(PIN_TEMP_SENSOR_1, INPUT); // сенсор LM35 подключим к аналоговому входу A0
+  pinMode(PIN_TEMP_SENSOR_2, INPUT); // Второй сенсор к A1
+  tempBuff1 = 0;
+  tempBuff2 = 0;
+  temp1MeasureCount = 0;
+  temp2MeasureCount = 0;
   
   
-  //Display
+//Display
   lcd.init();                     
   lcd.backlight();    // Включаем подсветку дисплея
   lcd.clear();
@@ -137,207 +136,120 @@ void setup()
   lcd.createChar(0, temp_cel); //создаем сивол градуса
 
 
-  //Analog temp
-  pinMode(PIN_TEMP_SENSOR_1, INPUT); // сенсор LM35 подключим к аналоговому входу A0
-  pinMode(PIN_TEMP_SENSOR_2, INPUT); // Второй сенсор
-  tempBuff1 = 0;
-  tempBuff2 = 0;
-  temp1MeasureCount = 0;
-  temp2MeasureCount = 0;
+  
 
 
+  timerTempCounter.setTimeout(3000);        // время усреднения температуры
+  timerTempCounter.restart();
+
+  timerRainCounter.setTimeout(3000);        // время усреднения дождя
+  timerRainCounter.restart();
+
+  timerOdometerCounter.setTimeout(1500);    // время усреднения пройденного расстояния
+  timerOdometerCounter.restart();
 
   
 }
 //**********************************************************************************************************
 void loop()
 {
-  unsigned long currentMillis = millis(); //время в мс с начала работы МК
+
+//GPS speed
+  getSpeedFromGPS();
+
+//GPS speed counter
+  speedCount();
+ 
+//Count moved distance
+  if (timerOdometerCounter.onRestart()) {
+    countMovedDistance();
+  }
 
 
-  //GPS speed
-  if (age == TinyGPS::GPS_INVALID_AGE || age > 2000)
-  {
-    //GPS connection lost
-    iSpeed = 0;
-    Serial.println("connection lost");
-  }
-  else
-  {
-    //GPS connection is up to date
-    iSpeed = round(gps.f_speed_mps()); // speed in meters per second
-    
-  }
-  smartdelay(100);
+
+//Buttons state read 
+  readButtonsState();
+
+
   
+//Auto oiling term
+  chainOiling(50); //условие на автоматическую подачу масла, в скобках время срабатывания насоса в милисекундах
 
-
-  //GPS odometr
-  speedBuff += iSpeed;
-  speedMeasureCount += 1;
-  if (currentMillis - previousMillisOdo >= intervalOdo) {
-    previousMillisOdo = currentMillis;
-    
-    averageSpeed = speedBuff / speedMeasureCount;           //average speed in intervalOdo
-    if (averageSpeed >= 3) {
-      distanceMoved += averageSpeed * (intervalOdo / 1000);
-    }
-    
-    Serial.println(distanceMoved);
-    if (distanceMoved > distanceToOil) {
+//Manual Oiling
+  if (buttonManualOilState == LOW){
       digitalWrite(PIN_RELAY, LOW);
-      delay(oilTime);     //и тут захерачим пока на delay, пока буду тестировать насос дома
+  } else 
       digitalWrite(PIN_RELAY, HIGH);
-      distanceMoved = 0;
-    }
-
-    speedBuff = 0;
-    speedMeasureCount = 0;
-  }
   
 
-
-  //Button 
-  buttonIncrementState= digitalRead(BUTTON_PIN_INCREMENT_OIL_TIME);
-  buttonDecrementState= digitalRead(BUTTON_PIN_DECREMENT_OIL_TIME);
-  buttonManualOilState= digitalRead(BUTTON_MANUAL_OIL);
   
-  //Increment
+//Increment
   if (distanceToOil < 9950){
-    if ( (buttonIncrementPrevState == HIGH) && (buttonIncrementState == LOW) ) {
-      distanceToOil += 50;  
-      hi = highByte(distanceToOil);
-      low = lowByte(distanceToOil);
-      EEPROM.write(1, hi);
-      EEPROM.write(2, low);  
-      digitalWrite(SOUND_PIN, HIGH);    //лень делать цикл, поэтому делэй
-      delay(85);                        //особой роли не сыграет, так как на кнопки не часто планируется нажимать
-      digitalWrite(SOUND_PIN, LOW);     //да и даже при большой скорости нажатий все равно темпераура отлично считывается
-    } 
+    if (buttonClickCheck(buttonIncrementPrevState, buttonIncrementState))
+      incrementDistanceToOil();
   }
   buttonIncrementPrevState= buttonIncrementState;         // предыдущее состояние кнопки = текущему
 
 
-  //Decrement
+//Decrement
   if ( distanceToOil > 0){
-    if ( (buttonDecrementPrevState == HIGH) && (buttonDecrementState == LOW) ) {
-      distanceToOil -= 50;  
-       hi = highByte(distanceToOil);
-       low = lowByte(distanceToOil);
-       EEPROM.write(1, hi);
-       EEPROM.write(2, low);
-       digitalWrite(SOUND_PIN, HIGH); //лень делать цикл, поэтому делэй
-       delay(85);                     //особой роли не сыграет, так как на кнопки не часто планируется нажимать
-       digitalWrite(SOUND_PIN, LOW);
-    } 
+    if (buttonClickCheck(buttonDecrementPrevState, buttonDecrementState))
+      decrementDistanceToOil();
   }
   buttonDecrementPrevState = buttonDecrementState;         // предыдущее состояние кнопки = текущему
 
-  //Manual Oil
- // if ( (buttonManualOilPrevState == HIGH) && (buttonManualOilState == LOW) ) {
-    if (buttonManualOilState == LOW){
-        digitalWrite(PIN_RELAY, LOW);
-    } else 
-        digitalWrite(PIN_RELAY, HIGH);
-//  buttonManualOilPrevState = buttonManualOilState;
-
-
-
-  //Oiler
- 
+//Oiler distance print
   lcd.setCursor(12, 0);
   lcd.print(distanceToOil);
 
-    //Relay
-//  if (currentMillis - previousMillisRelay >= intervalRelay) {
-//    previousMillisRelay = currentMillis;
-//    digitalWrite(PIN_RELAY, HIGH); //Реле закрыто
-//  }
 
 
-  //Rain Sensor
 
-      delay(5);
-      rainSenseReading = analogRead(PIN_RAIN_SENSOR);   
-      delay(5);
-      rainBuff += rainSenseReading;
-      rainMeasureCount += 1;
-  
-  
-  
-  if (currentMillis - previousMillisRain >= intervalRain) {
-    previousMillisRain = currentMillis;
+//********READ FROM SENSORS*****
 
-  //Когда дождь идет, то значение с датчика будет маленьким. 
-  //Когда дождя нет, то датчик будет высыхать и значения, приходящие с него будут увеличиваться  
-  rainResult = rainBuff / rainMeasureCount;
- 
-  if (rainResult < 200 && !isRain) {  //тут устанавливается порог срабатывания
-      rainGoCounter++;                //если дождь идет, но режим дождя еще не запущен
-      rainStopCounter = 0;
-  } 
-  if (rainResult < 200 && isRain) {   //условие написано, чтобы лишний раз не инкрементировать переменнную
-      rainStopCounter = 0;            //если дождь идет и режим дождя запущен
-  }   
-  if (rainResult > 300 && isRain) {   // порог отключения режима дождя
-      rainStopCounter++;
-      rainGoCounter = 0;              // если дождь закончился, но режим дождя еще стоит
-  }
-  if (rainResult > 300 && !isRain) {  
-      rainGoCounter = 0;              // если дождь закончился и режим дождя выключен
-  } 
-
-  if (rainGoCounter > 2){    // если после X циклов дождь не кончился, то включается режим RAIN
-    isRain = true;
-    lcd.setCursor(11, 1); 
-    lcd.print(" RAIN");
-  }  
-  if (rainStopCounter > 3) {
-    isRain = false; 
-    lcd.setCursor(11, 1); 
-    lcd.print("     "); 
-  }
-
-  rainMeasureCount = 0;
-  rainBuff = 0; 
+  //Read analog signal from rain sensor
+  rainSensorRead();
+  if (timerRainCounter.onRestart()) {
+    rainCountAndPrint();
   }
   
+  //Analog temp read
+  tempSensorRead();
+  if(timerTempCounter.onRestart()) {   
+    tempCountAndPrint();
+  }
 
-
+  //This is because NOFIX must print above other prints
   if (iSpeed < 0) {
     lcd.setCursor(11, 1);
     lcd.print("NOFIX");
   }
 
-  
-  
-  //Analog temp
-  delay(5);
-  temp1 = analogRead(PIN_TEMP_SENSOR_1); // переменная находится в интервале 0 - 1023 
-  
-  delay(5);
-  temp2 = analogRead(PIN_TEMP_SENSOR_2);
-  delay(5);
-
-  if (temp1 < 1017){                    //пытаемся отсечь выбросы, которые у меня наблюдались при мониторинге порта
-  grad1 = ( temp1/1023.0 )*4.9*1000/10; // преобразуем в градуся цельсия
-  tempBuff1 +=  grad1;                  // накапливаем температуру, чтобы потом получить среднее
-  temp1MeasureCount +=  1;     //считаем число циклов для того, чтобы вычислить среднюю температуру
-  }
-  
-  if(temp2 < 1017){
-  grad2 = ( temp2/1023.0 )*4.9*1000/10;
-  tempBuff2 +=  grad2;
-  temp2MeasureCount +=  1;     //считаем число циклов для того, чтобы вычислить среднюю температуру
-  }
- 
  
   
+}
 
-  if (currentMillis - previousMillisTemp >= intervalTemp) {
-    previousMillisTemp = currentMillis;
-    
-    resultTemp1 = round(tempBuff1 / temp1MeasureCount);  //получаем среднюю температура за interval
+
+
+
+
+
+
+//*************************FUNCTION******************************************************
+
+static void smartdelay(unsigned long ms)
+{
+  unsigned long start = millis();
+  do 
+  {
+    while (ss.available())
+      gps.encode(ss.read());
+  } while (millis() - start < ms);
+}
+
+static void tempCountAndPrint() {
+ 
+  resultTemp1 = round(tempBuff1 / temp1MeasureCount);  //получаем среднюю температура за interval
     resultTemp2 = round(tempBuff2 / temp2MeasureCount);
     
     
@@ -372,41 +284,164 @@ void loop()
       lcd.setCursor(4, 1); 
     }
     lcd.print(resultTemp2);
-    
+
+    //отобразить градусы цельсия
+    lcd.setCursor(7, 0);
+    lcd.print(char(0));
+    lcd.print("C");
+    lcd.setCursor(7, 1);
+    lcd.print(char(0)); 
+    lcd.print("C");
+
+    //сбросить перед следующим циклом
     temp1MeasureCount = 0;
     temp2MeasureCount = 0;
     tempBuff1 = 0;
     tempBuff2 = 0;   
+}
+
+static void tempSensorRead() {
+  delay(5);
+  temp1 = analogRead(PIN_TEMP_SENSOR_1); // переменная находится в интервале 0 - 1023 
+  
+  delay(5);
+  temp2 = analogRead(PIN_TEMP_SENSOR_2);
+  delay(5);
+
+  if (temp1 < 1017){                    //пытаемся отсечь выбросы, которые у меня наблюдались при мониторинге порта
+  grad1 = ( temp1/1023.0 )*4.9*1000/10; // преобразуем в градуся цельсия
+  tempBuff1 +=  grad1;                  // накапливаем температуру, чтобы потом получить среднее
+  temp1MeasureCount +=  1;     //считаем число циклов для того, чтобы вычислить среднюю температуру
   }
   
-  //Display
-  lcd.setCursor(7, 0);
-  lcd.print(char(0));
-  lcd.print("C");
-  lcd.setCursor(7, 1);
-  lcd.print(char(0)); 
-  lcd.print("C");
-  
-  
-  
+  if(temp2 < 1017){
+  grad2 = ( temp2/1023.0 )*4.9*1000/10;
+  tempBuff2 +=  grad2;
+  temp2MeasureCount +=  1;     //считаем число циклов для того, чтобы вычислить среднюю температуру
+  }
 }
 
-
-
-
-
-
-
-//*************************FUNCTION*************************
-
-static void smartdelay(unsigned long ms)
-{
-  unsigned long start = millis();
-  do 
-  {
-    while (ss.available())
-      gps.encode(ss.read());
-  } while (millis() - start < ms);
+static void rainSensorRead() {
+  delay(5);
+  rainSenseReading = analogRead(PIN_RAIN_SENSOR);   //Rain Sensor
+  delay(5);
+  rainBuff += rainSenseReading;
+  rainMeasureCount += 1;
 }
+
+static void rainCountAndPrint() {
+  //Когда дождь идет, то значение с датчика будет маленьким. 
+  //Когда дождя нет, то датчик будет высыхать и значения, приходящие с него будут увеличиваться  
+  rainResult = rainBuff / rainMeasureCount;
  
+  if (rainResult < 200 && !isRain) {  //тут устанавливается порог срабатывания
+      rainGoCounter++;                //если дождь идет, но режим дождя еще не запущен
+      rainStopCounter = 0;
+  } 
+  if (rainResult < 200 && isRain) {   //условие написано, чтобы лишний раз не инкрементировать переменнную
+      rainStopCounter = 0;            //если дождь идет и режим дождя запущен
+  }   
+  if (rainResult > 300 && isRain) {   // порог отключения режима дождя
+      rainStopCounter++;
+      rainGoCounter = 0;              // если дождь закончился, но режим дождя еще стоит
+  }
+  if (rainResult > 300 && !isRain) {  
+      rainGoCounter = 0;              // если дождь закончился и режим дождя выключен
+  } 
+
+  if (rainGoCounter > 2){    // если после X циклов дождь не кончился, то включается режим RAIN
+    isRain = true;
+    lcd.setCursor(11, 1); 
+    lcd.print(" RAIN");
+  }  
+  if (rainStopCounter > 3) {
+    isRain = false; 
+    lcd.setCursor(11, 1); 
+    lcd.print("     "); 
+  }
+
+  rainMeasureCount = 0;
+  rainBuff = 0; 
+}
+
+static void decrementDistanceToOil() {
+  if ( (buttonDecrementPrevState == HIGH) && (buttonDecrementState == LOW) ) {
+      distanceToOil -= 50;  
+       hi = highByte(distanceToOil);
+       low = lowByte(distanceToOil);
+       EEPROM.write(1, hi);
+       EEPROM.write(2, low);
+       digitalWrite(SOUND_PIN, HIGH); //лень делать цикл, поэтому делэй
+       delay(85);                     //особой роли не сыграет, так как на кнопки не часто планируется нажимать
+       digitalWrite(SOUND_PIN, LOW);
+    } 
+}
+
+static void incrementDistanceToOil() {
+   if ( (buttonIncrementPrevState == HIGH) && (buttonIncrementState == LOW) ) {
+      distanceToOil += 50;  
+      hi = highByte(distanceToOil);
+      low = lowByte(distanceToOil);
+      EEPROM.write(1, hi);
+      EEPROM.write(2, low);  
+      digitalWrite(SOUND_PIN, HIGH);    //лень делать цикл, поэтому делэй
+      delay(85);                        //особой роли не сыграет, так как на кнопки не часто планируется нажимать
+      digitalWrite(SOUND_PIN, LOW);     //да и даже при большой скорости нажатий все равно темпераура отлично считывается
+    } 
+}
+
+static bool buttonClickCheck(bool previousState, bool currentState) {
+  if ( (previousState == HIGH) && (currentState == LOW) ) return true;
+  else return false; 
+}
+
+static void readButtonsState() {
+  buttonIncrementState= digitalRead(BUTTON_PIN_INCREMENT_OIL_TIME);
+  buttonDecrementState= digitalRead(BUTTON_PIN_DECREMENT_OIL_TIME);
+  buttonManualOilState= digitalRead(BUTTON_MANUAL_OIL);
+}
+
+static int countMovedDistance() {
+  averageSpeed = speedBuff / speedMeasureCount;           //average speed for timerOdometerCounter in m/s
+    if (averageSpeed >= 3) {
+      distanceMoved += averageSpeed * (timerOdometerCounter.getTimeout() / 1000);
+    }
+    
+    Serial.println(distanceMoved);
+   
+
+    speedBuff = 0;
+    speedMeasureCount = 0;
+}
+
+
+static void chainOiling(int oilingTime) {
+   if (distanceMoved > distanceToOil) {
+      digitalWrite(PIN_RELAY, LOW);
+      delay(oilingTime);     //и тут захерачим пока на delay, пока буду тестировать насос дома
+      digitalWrite(PIN_RELAY, HIGH);
+      distanceMoved = 0;
+    }
+}
+
+static void speedCount() {
+  speedBuff += iSpeed;
+  speedMeasureCount += 1;
+}
+
+static void getSpeedFromGPS() {
+  if (age == TinyGPS::GPS_INVALID_AGE || age > 2000)
+  {
+    //GPS connection lost
+    iSpeed = 0;
+    Serial.println("connection lost");
+  }
+  else
+  {
+    //GPS connection is up to date
+    iSpeed = round(gps.f_speed_mps()); // speed in meters per second
+    
+  }
+  smartdelay(100);    // без этого вроде не будут нормально данные читаться с GPS, надо будет попробовать без этой хрени
+}
 
