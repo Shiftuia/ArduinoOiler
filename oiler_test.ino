@@ -32,7 +32,7 @@ boolean buttonManualOilPrevState;   // предыдущее состояние �
 #define PIN_RELAY 7
 #define PIN_TEMP_SENSOR_1 A0
 #define PIN_TEMP_SENSOR_2 A1
-#define PIN_RAIN_SENSOR A3
+#define PIN_RAIN_SENSOR A2
 
 #define BUTTON_MANUAL_OIL 9
 #define SOUND_PIN 10
@@ -128,7 +128,7 @@ void setup()
   lcd.setCursor(0, 1);
   lcd.print("Air");
   
-  lcd.setCursor(5, 0);  //При запуске значения температуры не отображаются intervalTemp милисекунд
+  lcd.setCursor(5, 0);  //При запуске значения температуры не отображаются пока не будет получено усредненное значение
   lcd.print("##");
   lcd.setCursor(5, 1);
   lcd.print("##");
